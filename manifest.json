@@ -1,0 +1,44 @@
+{
+    "format_version": 2,
+    "header": {
+        "name": "VozProximitySystem",
+        "description": "Addon de Chat de Voz por Proximidad Optimizado",
+        "uuid": "2588d374-9040-427c-90b9-563345831343",
+        "version": [
+            1,
+            0,
+            0
+        ],
+        "min_engine_version": [
+            1,
+            20,
+            60
+        ]
+    },
+    "modules": [
+        {
+            "type": "script",
+            "language": "javascript",
+            "uuid": "b2542479-22c6-4559-9944-772922119139",
+            "entry": "scripts/main.js",
+            "version": [
+                1,
+                0,
+                0
+            ]
+        }
+    ],
+    "dependencies": [
+        {
+            "module_name": "@minecraft/server",
+            "version": "1.9.0"
+        },
+        {
+            "module_name": "@minecraft/server-net",
+            "version": "1.0.0-beta"
+        }
+    ],
+    "capabilities": [
+        "script_eval"
+    ]
+}
