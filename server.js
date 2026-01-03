@@ -7,25 +7,23 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: "*", // Permitir conexiones desde cualquier origen (para desarrollo)
+        origin: "*",
         methods: ["GET", "POST"]
     }
 });
 
-// Middleware
+// --- AQUÍ ESTABA EL PROBLEMA ---
+// Agregamos middleware para archivos estáticos
 app.use(cors());
 app.use(express.json());
+app.use(express.static('public')); // <--- ¡ESTA LÍNEA ES LA CLAVE!
 
 // Ruta para recibir posiciones desde Minecraft
 app.post('/api/positions', (req, res) => {
     const playersData = req.body;
-
-    // Validar que lleguen datos
     if (playersData && Array.isArray(playersData)) {
-        // Emitir a todos los clientes frontend conectados
         io.emit('update-positions', playersData);
     }
-
     res.sendStatus(200);
 });
 
