@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Bot de Radio 2.0</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body {
+            background: #000;
+            color: #0f0;
+            font-family: monospace;
+            text-align: center;
+            padding: 50px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🤖 RADIO BOT ACTIVO</h1>
+    <p id="status">Conectando...</p>
+    <script>
+        const socket = io();
+        const botName = "RadioBot";
+        // Coordenadas fijas
+        const pos = { x: 100, y: 70, z: 100, dimension: "minecraft:overworld" };
+
+        socket.on('connect', () => {
+            document.getElementById('status').innerText = "🟢 CONECTADO Y TRANSMITIENDO";
+
+            // 1. Registrase
+            socket.emit('register', botName);
+
+            // 2. Enviar posición constante
+            setInterval(() => {
+                fetch('/api/positions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify([{ name: botName, ...pos }])
+                }).catch(e => console.error(e));
+            }, 1000);
+
+            // 3. Generar y enviar Ruido (Bip Bip)
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const dest = audioCtx.createMediaStreamDestination();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+
+            osc.connect(gain);
+            gain.connect(dest);
+            osc.start();
+
+            // Hacer que suene intermitente
+            setInterval(() => {
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+                const time = audioCtx.currentTime;
+                gain.gain.setValueAtTime(0.2, time);
+                gain.gain.setValueAtTime(0, time + 0.1); // Duración del bip 0.1s
+            }, 500); // Cada medio segundo
+
+            // Grabadora
+            const recorder = new MediaRecorder(dest.stream);
+            recorder.ondataavailable = e => {
+                if (socket.connected && e.data.size > 0) socket.emit('voice', e.data);
+            };
+            recorder.start(100);
+        });
+    </script>
+</body>
+
+</html>
