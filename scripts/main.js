@@ -85,16 +85,14 @@ system.runInterval(() => {
         }
     }
 
-    // 4. Envío de Datos al Servidor (Solo si hay jugadores relevantes)
     if (dataToSend.length > 0) {
         const req = new HttpRequest(SERVER_URL + "/api/positions");
         req.method = HttpRequestMethod.Post;
         req.headers = [new HttpHeader("Content-Type", "application/json")];
         req.body = JSON.stringify(dataToSend);
 
-        http.request(req).catch(() => {
-            // Silencio intencional para evitar spam en logs
+        http.request(req).catch((err) => {
         });
     }
 
-}, 4); // Ejecutar cada 4 ticks
+}, 4);

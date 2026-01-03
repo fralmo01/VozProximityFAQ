@@ -121,6 +121,18 @@
             box-shadow: 0 0 10px rgba(0, 255, 136, 0.1);
         }
 
+        select {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--glass-border);
+            color: var(--text-color);
+            padding: 0.5rem;
+            margin-bottom: 1rem;
+            border-radius: 6px;
+            font-family: var(--font-mono);
+            outline: none;
+        }
+
         .visualizer-container {
             width: 100%;
             height: 60px;
@@ -396,7 +408,7 @@
 
     <!-- Dependencies -->
     <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <!-- Removed PeerJS -->
 </head>
 
 <body>
@@ -407,6 +419,12 @@
 
         <div class="input-group">
             <input type="text" id="username" placeholder="Ingresa tu Minecraft ID..." autocomplete="off">
+        </div>
+
+        <div class="input-group">
+            <select id="mic-select">
+                <option value="">Cargando micrófonos...</option>
+            </select>
         </div>
 
         <div class="visualizer-container">
@@ -450,24 +468,21 @@
     <script>
         // --- CONSTANTS ---
         const MAX_DISTANCE = 60; // Metros
-        const SCREAM_THRESHOLD = -5; // dB
-        const NORMAL_ROLLOFF = 20; // Atenuación normal hasta 20m
+        const CHUNK_TIME_MS = 100; // Enviar audio cada 100ms
 
         // --- STATE ---
         let myUsername = null;
         let localStream = null;
-        let audioContext = null;
+        let mediaRecorder = null;
         let socket = null;
-        let peer = null;
-        let peers = {}; // { username: { call, conn, ... } }
         let playersState = []; // Data from socket
         let isMuted = false;
-        let masterGainNode = null;
 
         // --- DOM ELEMENTS ---
         const loginView = document.getElementById('login-view');
         const hudView = document.getElementById('hud-view');
         const usernameInput = document.getElementById('username');
+        const micSelect = document.getElementById('mic-select');
         const btnJoin = document.getElementById('btn-join');
         const micBar = document.getElementById('mic-bar');
         const statusMsg = document.getElementById('status-msg');
@@ -479,14 +494,27 @@
 
         // --- 1. INITIAL SETUP & LOGIN ---
 
-        async function initMic() {
+        async function initMic(deviceId = null) {
             try {
-                localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                const constraints = {
+                    audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+                    video: false
+                };
+
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                }
+
+                localStream = await navigator.mediaDevices.getUserMedia(constraints);
+
+                // List Devices
+                if (!deviceId) await listAudioInputs();
+
                 btnJoin.disabled = false;
                 statusMsg.textContent = "Micrófono listo. Ingresa tu ID.";
                 statusMsg.style.color = "#00ff88";
 
-                // Mic Visualizer for Login (Simple Analysis)
+                // Mic Visualizer for Login
                 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
                 const source = audioCtx.createMediaStreamSource(localStream);
                 const analyser = audioCtx.createAnalyser();
@@ -500,7 +528,7 @@
                     for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
                     let avg = sum / dataArray.length;
                     micBar.style.width = Math.min(100, avg * 2) + "%";
-                    requestAnimationFrame(drawMic);
+                    if (!loginView.classList.contains('hidden')) requestAnimationFrame(drawMic);
                 }
                 drawMic();
 
@@ -510,6 +538,23 @@
                 statusMsg.style.color = "#ff004c";
             }
         }
+
+        async function listAudioInputs() {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const audioInputs = devices.filter(device => device.kind === 'audioinput');
+
+            micSelect.innerHTML = '';
+            audioInputs.forEach(device => {
+                const option = document.createElement('option');
+                option.value = device.deviceId;
+                option.text = device.label || `Micrófono ${micSelect.length + 1}`;
+                micSelect.appendChild(option);
+            });
+        }
+
+        micSelect.addEventListener('change', (e) => {
+            initMic(e.target.value);
+        });
 
         initMic(); // Request permission on load
 
@@ -530,21 +575,11 @@
             hudView.classList.remove('hidden');
             displayUsername.textContent = myUsername;
 
-            // Audio Context Setup
-            audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            masterGainNode = audioContext.createGain();
-            masterGainNode.connect(audioContext.destination);
-
-            // Setup Local Analyser for "Self Glow" & Scream Detection
-            const localSource = audioContext.createMediaStreamSource(localStream);
-            const localAnalyser = audioContext.createAnalyser();
-            localAnalyser.fftSize = 64;
-            localSource.connect(localAnalyser);
-            startMicAnalysis(localAnalyser);
-
-            // Connect to Socket & Peer
+            // Connect to Socket
             connectSocket();
-            connectPeer();
+
+            // Start Audio Transmission
+            startAudioTransmission();
         }
 
         function connectSocket() {
@@ -552,315 +587,133 @@
 
             socket.on('connect', () => {
                 console.log("Socket connected:", socket.id);
+                // REGISTER USERNAME
+                socket.emit('register', myUsername);
             });
 
+            // Update Player Positions for Radar
             socket.on('update-positions', (data) => {
-                // data: [{ name, x, y, z, is_underground }, ...]
                 playersState = data;
-                updateProximityLogic();
-                renderRadar();
-            });
-        }
+                renderRadar(); // Update UI
 
-        function connectPeer() {
-            // Using username as PeerID for simplicity
-            peer = new Peer(myUsername, {
-                debug: 2
+                // Also Check Self-Glow logic based on talking?
+                // We'll trust the visualizer logic for that.
             });
 
-            peer.on('open', (id) => {
-                console.log('My Peer ID is: ' + id);
-            });
+            // RECEIVE VOICE
+            socket.on('voice', async ({ audio, distance }) => {
+                if (!audio) return;
 
-            // Handle incoming calls
-            peer.on('call', (call) => {
-                console.log("Incoming call from:", call.peer);
-                call.answer(localStream);
-                handleCallStream(call);
-            });
+                try {
+                    // 1. Blob Data
+                    const audioBlob = new Blob([audio], { type: 'audio/webm;codecs=opus' });
+                    const audioUrl = URL.createObjectURL(audioBlob);
 
-            // Handle incoming data (Screaming status)
-            peer.on('connection', (conn) => {
-                conn.on('data', (data) => {
-                    if (data.type === 'SCREAMING') {
-                        handleScreamEvent(conn.peer, data.value);
-                    }
-                });
-                // Store connection
-                if (!peers[conn.peer]) peers[conn.peer] = {};
-                peers[conn.peer].conn = conn;
-            });
-        }
+                    // 2. Play
+                    const audioEl = new Audio(audioUrl);
 
-        // --- 3. CORE LOGIC ---
+                    // 3. Volume Attenuation
+                    // Max Volume at 0m, 0 Volume at 20m.
+                    let volume = Math.max(0, 1 - (distance / 20));
 
-        function updateProximityLogic() {
-            // Find my position
-            const me = playersState.find(p => p.name === myUsername);
-            if (!me) return; // Not in game yet
+                    // Apply Master Volume
+                    volume *= parseFloat(masterVolumeSlider.value);
 
-            playersState.forEach(player => {
-                if (player.name === myUsername) return; // Skip self
+                    audioEl.volume = Math.min(1, Math.max(0, volume));
 
-                const dist = getDistance(me, player);
-                const isNearby = dist <= MAX_DISTANCE;
+                    await audioEl.play();
 
-                // 1. Connection Management
-                if (isNearby) {
-                    if (!peers[player.name]?.call) {
-                        // Connect if not connected
-                        callPeer(player.name);
-                    }
-                    // Update Audio Position
-                    if (peers[player.name]?.panner) {
-                        updateAudioPosition(player, me, peers[player.name]);
-                    }
-                } else {
-                    // Close connection if far (optimization)
-                    // In a real robust app, maybe just mute instead of disconnect to avoid thrashing
-                    // For this requirements: "Cierra conexiones o silencia streams"
-                    // We'll mute gain to 0 to keep connection alive but save processing? 
-                    // Let's close call to be strict with requirement "Cierra conexiones... para optimizar CPU"
-                    if (peers[player.name]?.call) {
-                        peers[player.name].call.close();
-                        delete peers[player.name].call;
-                        delete peers[player.name].panner; // Cleanup audio nodes
-                        delete peers[player.name].gain;
-                    }
+                    // Cleanup
+                    audioEl.onended = () => URL.revokeObjectURL(audioUrl);
+
+                } catch (e) {
+                    console.error("Error playing audio chunk", e);
                 }
             });
-
-            // Clean up players who left server completely
-            // (omitted for brevity, assume socket sends current snapshot)
         }
 
-        function callPeer(remoteId) {
-            console.log("Calling:", remoteId);
-            const call = peer.call(remoteId, localStream);
-            const conn = peer.connect(remoteId);
-
-            if (!peers[remoteId]) peers[remoteId] = {};
-            peers[remoteId].call = call;
-            peers[remoteId].conn = conn; // Data channel for scream
-
-            handleCallStream(call);
-        }
-
-        function handleCallStream(call) {
-            call.on('stream', (remoteStream) => {
-                // Setup Web Audio Graph for this peer
-                // [Source] -> [Gain] -> [Panner] -> [Convolver] -> [Master]
-                const source = audioContext.createMediaStreamSource(remoteStream);
-
-                const gain = audioContext.createGain();
-                const panner = audioContext.createPanner();
-                const convolver = audioContext.createConvolver();
-
-                // Configure Panner
-                panner.panningModel = 'HRTF';
-                panner.distanceModel = 'linear';
-
-                // Create Impulse Response for Cave (Simple noise)
-                const buffer = audioContext.createBuffer(2, audioContext.sampleRate * 2, audioContext.sampleRate);
-                for (let i = 0; i < buffer.length; i++) {
-                    // Simple noise decay
-                    buffer.getChannelData(0)[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / buffer.length, 2);
-                    buffer.getChannelData(1)[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / buffer.length, 2);
-                }
-                convolver.buffer = buffer;
-
-                // Route: Default Bypass Convolver initially
-                // We construct a graph where we can crossfade or switch convolver?
-                // Simplest: Source -> Panner -> Gain -> Master
-                // We'll insert Convolver dynamically or use a Dry/Wet mix.
-                // Let's keep it simple: Source -> Panner -> Gain -> [Convolver?] -> Master
-
-                source.connect(panner);
-                panner.connect(gain);
-                gain.connect(masterGainNode); // Initially connect directly (Dry)
-
-                // Store nodes
-                if (!peers[call.peer]) peers[call.peer] = {};
-                peers[call.peer].panner = panner;
-                peers[call.peer].gain = gain;
-                peers[call.peer].convolver = convolver;
-                peers[call.peer].isCave = false;
-                peers[call.peer].source = source; // Keep ref
-            });
-
-            call.on('close', () => {
-                console.log("Call closed:", call.peer);
-            });
-        }
-
-        function updateAudioPosition(target, me, peerObj) {
-            if (!peerObj.panner) return;
-
-            // Relative Position
-            // Web Audio Panner works in listeners coordinate system usually, or world.
-            // Simplest: We set AudioListener to (0,0,0) and facing (0,0,-1).
-            // Then we place Panner relative to that.
-
-            // RelX = target.x - me.x
-            // RelZ = target.z - me.z
-            const relX = target.x - me.x;
-            const relZ = target.z - me.z;
-            const relY = target.y - me.y;
-
-            peerObj.panner.positionX.value = relX;
-            peerObj.panner.positionY.value = relY;
-            peerObj.panner.positionZ.value = relZ;
-
-            // Distance & Screaming Logic
-            const dist = Math.sqrt(relX * relX + relZ * relZ);
-
-            if (peerObj.isScreaming) {
-                // Screaming: Hear up to 60m
-                // Map 0-60m to Gain 1-0
-                let volume = 1 - (dist / MAX_DISTANCE);
-                if (volume < 0) volume = 0;
-                peerObj.gain.gain.value = volume;
-            } else {
-                // Normal: Hear up to 20m
-                let volume = 1 - (dist / NORMAL_ROLLOFF);
-                if (volume < 0) volume = 0;
-                peerObj.gain.gain.value = volume;
+        function startAudioTransmission() {
+            // Use MediaRecorder to send chunks
+            // mimeType 'audio/webm;codecs=opus' is standard for efficient web audio
+            let options = { mimeType: 'audio/webm;codecs=opus' };
+            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                console.warn("Opus not supported, falling back to default");
+                options = {};
             }
 
-            // Cave Logic
-            // If target is underground => Activate Convolver
-            if (target.is_underground) {
-                if (!peerObj.isCave) {
-                    // Switch to wet path
-                    peerObj.gain.disconnect();
-                    peerObj.gain.connect(peerObj.convolver);
-                    peerObj.convolver.connect(masterGainNode);
-                    peerObj.isCave = true;
-                }
-            } else {
-                if (peerObj.isCave) {
-                    // Switch back to dry
-                    peerObj.convolver.disconnect();
-                    peerObj.gain.disconnect();
-                    peerObj.gain.connect(masterGainNode);
-                    peerObj.isCave = false;
-                }
-            }
-        }
+            mediaRecorder = new MediaRecorder(localStream, options);
 
-        function startMicAnalysis(analyser) {
-            const data = new Uint8Array(analyser.frequencyBinCount);
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0 && !isMuted && socket && socket.connected) {
+                    socket.emit('voice', event.data);
 
-            setInterval(() => {
-                analyser.getByteFrequencyData(data);
-                // Calculate average volume
-                let sum = 0;
-                for (let i = 0; i < data.length; i++) sum += data[i];
-                const avg = sum / data.length;
-
-                // Visual Glow
-                const isTalking = avg > 10;
-                if (isTalking) {
+                    // Visual feedback for self
                     selfGlow.classList.add('active');
-                } else {
-                    selfGlow.classList.remove('active');
+                    setTimeout(() => selfGlow.classList.remove('active'), 100);
                 }
+            };
 
-                // Check Scream (> -5dB approx). 
-                // ByteData is 0-255. 0 is silence (-Infinity dB), 255 is 0dB approx.
-                // -5dB is roughly top 90% of scale? ~230?
-                // Let's tone is down for easy testing: say > 200 (approx -10dB to -5dB range)
-                const isScreaming = avg > 200;
-
-                // Send to all peers
-                Object.values(peers).forEach(p => {
-                    if (p.conn && p.conn.open) {
-                        // Only send if state changed to avoid flood (simple debounce needed in real app)
-                        p.conn.send({ type: 'SCREAMING', value: isScreaming });
-                    }
-                });
-
-            }, 100);
+            // Start recording and slice into chunks every CHUNK_TIME_MS
+            mediaRecorder.start(CHUNK_TIME_MS);
         }
 
-        function handleScreamEvent(peerId, isScreaming) {
-            if (peers[peerId]) {
-                peers[peerId].isScreaming = isScreaming;
-                // UI feedback in radar
-                const card = document.getElementById(`card-${peerId}`);
-                if (card) {
-                    const statusText = card.querySelector('.status-text');
-                    if (isScreaming) {
-                        statusText.innerHTML = '<span class="status-badge bg-scream">😱 GRITANDO</span>';
-                    } else {
-                        // Revert will happen on next renderRadar frame based on state
-                    }
+        // --- 3. UI CONTROLS ---
+
+        btnToggleMute.addEventListener('click', () => {
+            isMuted = !isMuted;
+            if (isMuted) {
+                btnToggleMute.textContent = "MUTED";
+                btnToggleMute.classList.add('muted');
+                if (mediaRecorder && mediaRecorder.state === 'recording') {
+                    mediaRecorder.pause();
+                }
+            } else {
+                btnToggleMute.textContent = "MIC ON";
+                btnToggleMute.classList.remove('muted');
+                if (mediaRecorder && mediaRecorder.state === 'paused') {
+                    mediaRecorder.resume();
                 }
             }
-        }
+        });
 
-        function getDistance(p1, p2) {
-            return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.z - p2.z, 2));
-        }
-
-        // --- 4. RENDER UI ---
-
+        // --- 4. RADAR RENDERER (Keep existing logic but simplified) ---
         function renderRadar() {
             radarList.innerHTML = '';
 
             const me = playersState.find(p => p.name === myUsername);
             if (!me) return;
 
-            // Sort by distance
-            const others = playersState
-                .filter(p => p.name !== myUsername)
-                .map(p => ({ ...p, dist: getDistance(me, p) }))
-                .sort((a, b) => a.dist - b.dist);
+            playersState.forEach(player => {
+                if (player.name === myUsername) return;
 
-            others.forEach(player => {
-                const isNear = player.dist <= MAX_DISTANCE;
-                const isScreaming = peers[player.name]?.isScreaming || false;
+                // Calculate Distance
+                const dx = me.x - player.x;
+                const dy = me.y - player.y; // Height matters too
+                const dz = me.z - player.z;
+                const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-                // Status Badge Helper
-                let statusHtml = '';
-                if (isScreaming) statusHtml += '<span class="status-badge bg-scream">😱 GRITANDO</span>';
-                if (player.is_underground) statusHtml += '<span class="status-badge bg-cave">🏠 CUEVA</span>';
-                if (!statusHtml) statusHtml = '<span class="status-badge" style="background:#333;color:#aaa">NORMAL</span>';
+                const card = document.createElement('div');
+                card.className = `player-card ${dist < 20 ? 'in-range' : 'out-range'}`;
 
-                const div = document.createElement('div');
-                div.id = `card-${player.name}`;
-                div.className = `player-card ${isNear ? 'in-range' : 'out-range'}`;
-                div.innerHTML = `
+                // Badges
+                let badges = '';
+                if (player.is_underground) badges += '<span class="status-badge bg-cave">🏠 CUEVA</span>';
+
+                card.innerHTML = `
                     <div class="player-info">
                         <div class="player-name">${player.name}</div>
-                        <div class="player-details status-text">
-                            ${statusHtml}
+                        <div class="player-details">
+                            <span>${dist.toFixed(1)}m</span>
+                            ${badges}
                         </div>
                     </div>
-                    <div class="distance-indicator" style="color: ${isNear ? '#00ff88' : '#555'}">
-                        ${Math.round(player.dist)}m
+                    <div class="distance-indicator">
+                        ${dist < 20 ? '🔊' : '🔇'}
                     </div>
                 `;
-                radarList.appendChild(div);
+                radarList.appendChild(card);
             });
         }
-
-        // --- Controls ---
-        btnToggleMute.addEventListener('click', () => {
-            if (localStream) {
-                isMuted = !isMuted;
-                localStream.getAudioTracks()[0].enabled = !isMuted;
-                btnToggleMute.textContent = isMuted ? "MIC OFF" : "MIC ON";
-                btnToggleMute.classList.toggle('muted', isMuted);
-            }
-        });
-
-        masterVolumeSlider.addEventListener('input', (e) => {
-            if (masterGainNode) {
-                masterGainNode.gain.value = e.target.value;
-            }
-        });
-
     </script>
 </body>
 

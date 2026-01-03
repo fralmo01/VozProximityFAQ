@@ -7,29 +7,20 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: "*", // En producción, restringe esto a tu dominio real
+        origin: "*",
         methods: ["GET", "POST"]
     }
 });
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// --- Estructuras de Datos ---
-// Almacena la última posición conocida de cada jugador (desde Minecraft)
-// Clave: Gamertag (string), Valor: { x, y, z, dimension }
 const playerPositions = new Map();
-
-// Vincula el socket.id con el Gamertag del usuario conectado en la web
-// Clave: Socket.id, Valor: Gamertag (string)
 const socketUserMap = new Map();
 
-
-// --- Endpoints HTTP (Comunicación con Minecraft) ---
 app.post('/api/positions', (req, res) => {
-    const playersData = req.body; // Espera: [{ name: "Steve", x: 100, y: 70, z: 100, dimension: "..." }, ...]
+    const playersData = req.body;
 
     if (playersData && Array.isArray(playersData)) {
         playersData.forEach(player => {
@@ -42,69 +33,49 @@ app.post('/api/positions', (req, res) => {
                 });
             }
         });
-        // Opcional: Podríamos limpiar jugadores que ya no vienen en la lista, 
-        // pero por seguridad mantengamos la última posición conocida.
     }
     res.sendStatus(200);
 });
-
-// --- Lógica de Sockets (Comunicación con Cliente Web) ---
 io.on('connection', (socket) => {
     console.log('Nuevo cliente conectado:', socket.id);
-
-    // Evento: 'register'
-    // El cliente web debe enviar su gamertag al conectarse
     socket.on('register', (gamertag) => {
         if (gamertag) {
             socketUserMap.set(socket.id, gamertag);
             console.log(`Socket ${socket.id} registrado como ${gamertag}`);
         }
     });
-
-    // Evento: 'voice'
-    // Recibe audio del cliente y lo reenvía solo a jugadores cercanos
     socket.on('voice', (audioData) => {
         const senderGamertag = socketUserMap.get(socket.id);
-
-        // Si el usuario no se ha registrado, ignoramos
         if (!senderGamertag) return;
 
         const senderPos = playerPositions.get(senderGamertag);
-
-        // Si no tenemos posición del emisor (no está en Minecraft o no ha enviado datos aún), ignoramos
         if (!senderPos) return;
 
-        // Recorremos todos los sockets conectados para ver quién debe recibir el audio
         io.sockets.sockets.forEach((targetSocket) => {
-            // No enviar a uno mismo
             if (targetSocket.id === socket.id) return;
 
             const targetGamertag = socketUserMap.get(targetSocket.id);
-
-            // Si el receptor no se ha registrado, ignoramos
             if (!targetGamertag) return;
 
             const targetPos = playerPositions.get(targetGamertag);
-
-            // Si no tenemos posición del receptor, ignoramos
             if (!targetPos) return;
 
-            // Verificamos misma dimensión
             if (senderPos.dimension !== targetPos.dimension) return;
-
-            // Calculamos distancia 3D
             const distance = Math.sqrt(
                 Math.pow(senderPos.x - targetPos.x, 2) +
                 Math.pow(senderPos.y - targetPos.y, 2) +
                 Math.pow(senderPos.z - targetPos.z, 2)
             );
 
-            // Si está dentro del rango (20 bloques), enviamos el audio con la distancia
             if (distance < 20) {
                 targetSocket.emit('voice', {
                     audio: audioData,
                     distance: distance
                 });
+                // Debug Log (Opcional: reduce esto en producción si hay mucho spam)
+                // console.log(`Enviando audio de ${senderGamertag} a ${targetGamertag} (Dist: ${distance.toFixed(2)}m)`);
+            } else {
+                // console.log(`Audio descartado por distancia: ${distance.toFixed(2)}m`);
             }
         });
     });
